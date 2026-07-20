@@ -9,6 +9,74 @@ import '../../lib/opencc.min.js';
 export default defineBackground(() => {
     // 页面状态管理
     let tabPageStates = new Map(); // 存储每个标签页的页面状态
+    let pendingSearchResultsByTab = new Map();
+    let pendingNoMatchResultsByTab = new Map();
+    let cleanupIntervalId = null;
+
+    function getPendingPopupStorageKey(type, tabId) {
+        return `${type}:${tabId}`;
+    }
+
+    async function getPendingPopupData(type, tabId) {
+        const memoryStore =
+            type === 'pendingSearchResults'
+                ? pendingSearchResultsByTab
+                : pendingNoMatchResultsByTab;
+
+        if (memoryStore.has(tabId)) {
+            return memoryStore.get(tabId);
+        }
+
+        const storageKey = getPendingPopupStorageKey(type, tabId);
+        const result = await browser.storage.local.get(storageKey);
+        return result[storageKey] || null;
+    }
+
+    async function clearPendingPopupData(type, tabId) {
+        const memoryStore =
+            type === 'pendingSearchResults'
+                ? pendingSearchResultsByTab
+                : pendingNoMatchResultsByTab;
+
+        memoryStore.delete(tabId);
+        await browser.storage.local.remove(getPendingPopupStorageKey(type, tabId));
+    }
+
+    async function clearAllPendingPopupData(tabId) {
+        pendingSearchResultsByTab.delete(tabId);
+        pendingNoMatchResultsByTab.delete(tabId);
+        await browser.storage.local.remove([
+            getPendingPopupStorageKey('pendingSearchResults', tabId),
+            getPendingPopupStorageKey('pendingNoMatchResults', tabId)
+        ]);
+    }
+
+    async function setPendingPopupData(type, tabId, data) {
+        if (type === 'pendingSearchResults') {
+            pendingSearchResultsByTab.set(tabId, data);
+            pendingNoMatchResultsByTab.delete(tabId);
+            await browser.storage.local.remove(
+                getPendingPopupStorageKey('pendingNoMatchResults', tabId)
+            );
+        } else {
+            pendingNoMatchResultsByTab.set(tabId, data);
+            pendingSearchResultsByTab.delete(tabId);
+            await browser.storage.local.remove(
+                getPendingPopupStorageKey('pendingSearchResults', tabId)
+            );
+        }
+
+        await browser.storage.local.set({
+            [getPendingPopupStorageKey(type, tabId)]: data
+        });
+    }
+
+    function scheduleCleanupInterval() {
+        if (cleanupIntervalId) return;
+        cleanupIntervalId = setInterval(cleanupExpiredPageStates, 60000); // 每分钟清理一次
+    }
+
+    setTimeout(() => scheduleCleanupInterval(), 100);
 
     // 页面状态管理函数
     function getTabPageState(tabId) {
@@ -43,15 +111,22 @@ export default defineBackground(() => {
         }
     }
 
-    // 定期清理过期状态
-    setInterval(cleanupExpiredPageStates, 60000); // 每分钟清理一次
+    // 定期清理过期状态（按总开关状态控制）
+    // 在初始化状态加载后再启动
 
     // 监听标签页关闭事件
     browser.tabs.onRemoved.addListener((tabId) => {
         clearTabPageState(tabId);
+        clearAllPendingPopupData(tabId).catch((error) => {
+            console.log(`清理标签页${tabId}待展示数据失败:`, error);
+        });
     });
 
     // WBI签名相关配置
+    const WBI_KEYS_CACHE_STORAGE_KEY = 'bilibili_wbi_keys_cache';
+    const WBI_KEYS_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+    let wbiKeysMemoryCache = null;
+
     const mixinKeyEncTab = [
         46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42, 19,
         29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4,
@@ -314,9 +389,58 @@ export default defineBackground(() => {
         return query + '&w_rid=' + wbi_sign;
     }
 
-    // 获取最新的 img_key 和 sub_key
-    async function getWbiKeys() {
+    function isValidWbiKeysCache(cache) {
+        return (
+            cache &&
+            cache.img_key &&
+            cache.sub_key &&
+            Number.isFinite(cache.expiresAt) &&
+            Date.now() < cache.expiresAt
+        );
+    }
+
+    async function readCachedWbiKeys() {
+        if (isValidWbiKeysCache(wbiKeysMemoryCache)) {
+            return wbiKeysMemoryCache;
+        }
+
+        const result = await browser.storage.local.get(WBI_KEYS_CACHE_STORAGE_KEY);
+        const cached = result[WBI_KEYS_CACHE_STORAGE_KEY];
+        if (isValidWbiKeysCache(cached)) {
+            wbiKeysMemoryCache = cached;
+            return cached;
+        }
+
+        return null;
+    }
+
+    async function writeCachedWbiKeys(keys) {
+        const cache = {
+            ...keys,
+            fetchedAt: Date.now(),
+            expiresAt: Date.now() + WBI_KEYS_CACHE_TTL_MS
+        };
+        wbiKeysMemoryCache = cache;
+        await browser.storage.local.set({
+            [WBI_KEYS_CACHE_STORAGE_KEY]: cache
+        });
+        return cache;
+    }
+
+    // 获取最新的 img_key 和 sub_key，6 小时内复用缓存
+    async function getWbiKeys({ forceRefresh = false } = {}) {
+        if (!forceRefresh) {
+            const cached = await readCachedWbiKeys();
+            if (cached) {
+                return {
+                    img_key: cached.img_key,
+                    sub_key: cached.sub_key
+                };
+            }
+        }
+
         const response = await fetch('https://api.bilibili.com/x/web-interface/nav', {
+            credentials: 'include',
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                 Referer: 'https://www.bilibili.com/'
@@ -332,12 +456,18 @@ export default defineBackground(() => {
         const img_key = img_url.slice(img_url.lastIndexOf('/') + 1, img_url.lastIndexOf('.'));
         const sub_key = sub_url.slice(sub_url.lastIndexOf('/') + 1, sub_url.lastIndexOf('.'));
 
-        return { img_key, sub_key };
+        const cached = await writeCachedWbiKeys({ img_key, sub_key });
+        return {
+            img_key: cached.img_key,
+            sub_key: cached.sub_key
+        };
     }
 
     // 获取视频信息
     async function getVideoInfo(bvid) {
-        const response = await fetch(`https://api.bilibili.com/x/web-interface/view?bvid=${bvid}`);
+        const response = await fetch(`https://api.bilibili.com/x/web-interface/view?bvid=${bvid}`, {
+            credentials: 'include'
+        });
         const data = await response.json();
 
         if (data.code !== 0) throw new Error(`获取视频信息失败: ${data.message}`);
@@ -347,7 +477,9 @@ export default defineBackground(() => {
             aid: data.data.aid,
             cid: data.data.cid,
             duration: data.data.duration,
-            title: data.data.title
+            title: data.data.title,
+            pic: data.data.pic || '',
+            author: data.data.owner?.name || ''
         };
     }
 
@@ -365,7 +497,9 @@ export default defineBackground(() => {
         const query = encWbi(params, wbiKeys.img_key, wbiKeys.sub_key);
         const url = `https://api.bilibili.com/x/v2/dm/wbi/web/seg.so?${query}`;
 
-        const response = await fetch(url);
+        const response = await fetch(url, {
+            credentials: 'include'
+        });
         if (!response.ok) {
             throw new Error(`HTTP error! status: ${response.status}`);
         }
@@ -387,13 +521,13 @@ export default defineBackground(() => {
     // 判断文本是否为纯英文和数字（去除标点符号后判断）
     function isPureEnglishOrNumber(text) {
         if (!text || typeof text !== 'string') return false;
-        
+
         // 先去除所有标点符号和特殊字符，只保留字母、数字和空格
         const cleaned = text.replace(/[^\w\s]/g, '');
-        
+
         // 如果清理后为空，说明只有标点符号
         if (!cleaned.trim()) return false;
-        
+
         // 判断是否只包含英文字母、数字和空格
         return /^[a-zA-Z0-9\s]*$/.test(cleaned);
     }
@@ -404,8 +538,8 @@ export default defineBackground(() => {
         if (parts.length === 1) return parts[0];
 
         // 分为纯英文数字部分和非纯英文数字部分
-        const nonPureEnglishParts = parts.filter(part => !isPureEnglishOrNumber(part));
-        const pureEnglishParts = parts.filter(part => isPureEnglishOrNumber(part));
+        const nonPureEnglishParts = parts.filter((part) => !isPureEnglishOrNumber(part));
+        const pureEnglishParts = parts.filter((part) => isPureEnglishOrNumber(part));
 
         // 优先从非纯英文数字部分中选择最长的
         if (nonPureEnglishParts.length > 0) {
@@ -429,9 +563,10 @@ export default defineBackground(() => {
         if (!title || typeof title !== 'string') return title;
 
         // 同时使用竖线和空格作为分隔符进行分割
-        const parts = title.split(/[｜|\s]+/)
-            .map(part => part.trim())
-            .filter(part => part.length > 0);
+        const parts = title
+            .split(/[｜|\s]+/)
+            .map((part) => part.trim())
+            .filter((part) => part.length > 0);
 
         // 如果分割后只有一个部分或无法分割，返回原标题
         if (parts.length <= 1) {
@@ -439,7 +574,7 @@ export default defineBackground(() => {
         }
 
         console.log(`标题分割结果:`, parts);
-        
+
         // 选择最佳部分
         return selectBestPart(parts);
     }
@@ -447,11 +582,11 @@ export default defineBackground(() => {
     // 去掉结尾的英文字符（只有去掉后还有内容时才去掉）
     function removeTrailingEnglish(text) {
         if (!text || typeof text !== 'string') return text;
-        
+
         // 匹配结尾的英文字母、数字、空格和常见标点符号
         const trailingEnglishRegex = /[a-zA-Z0-9\s\.,!?\-_'"():;]+$/;
         const match = text.match(trailingEnglishRegex);
-        
+
         if (match) {
             const withoutTrailing = text.slice(0, match.index).trim();
             // 只有去掉后还有内容时才返回去掉结尾的版本
@@ -460,7 +595,7 @@ export default defineBackground(() => {
                 return withoutTrailing;
             }
         }
-        
+
         return text; // 原样返回
     }
 
@@ -524,8 +659,8 @@ export default defineBackground(() => {
         try {
             const response = await fetch(`https://bsbsb.top/api/skipSegments?videoID=${bvid}`, {
                 headers: {
-                    "origin": "chrome-extension://dmkbhbnbpfijhgpnfahfioedledohfja",
-                    "x-ext-version": "1.1.5"
+                    origin: 'chrome-extension://dmkbhbnbpfijhgpnfahfioedledohfja',
+                    'x-ext-version': '2.0.0'
                 }
             });
 
@@ -540,11 +675,11 @@ export default defineBackground(() => {
             }
 
             const skipSegments = await response.json();
-            
+
             // 筛选出赞助（sponsor）类型的片段
             const sponsorSegments = skipSegments
-                .filter(segment => segment.category === 'sponsor')
-                .map(segment => segment.segment)
+                .filter((segment) => segment.category === 'sponsor')
+                .map((segment) => segment.segment)
                 .sort((a, b) => a[0] - b[0]); // 按开始时间排序
 
             if (sponsorSegments.length === 0) {
@@ -553,17 +688,21 @@ export default defineBackground(() => {
 
             // 获取bilibili视频原始长度（取第一个片段的videoDuration）
             const bilibiliVideoDuration = skipSegments[0]?.videoDuration;
-            
+
             if (bilibiliVideoDuration && youtubeVideoDuration) {
                 const durationDiff = Math.abs(bilibiliVideoDuration - youtubeVideoDuration);
-                
+
                 if (durationDiff <= 5) {
                     // 长度相近，YouTube可能未去sponsor，跳过处理
-                    console.log(`YouTube视频长度(${youtubeVideoDuration}s)与bilibili原始长度(${bilibiliVideoDuration}s)相近，跳过sponsor处理`);
+                    console.log(
+                        `YouTube视频长度(${youtubeVideoDuration}s)与bilibili原始长度(${bilibiliVideoDuration}s)相近，跳过sponsor处理`
+                    );
                     return danmakus;
                 }
-                
-                console.log(`YouTube视频长度(${youtubeVideoDuration}s)与bilibili原始长度(${bilibiliVideoDuration}s)差异较大，正常处理sponsor片段`);
+
+                console.log(
+                    `YouTube视频长度(${youtubeVideoDuration}s)与bilibili原始长度(${bilibiliVideoDuration}s)差异较大，正常处理sponsor片段`
+                );
             }
 
             console.log(`发现 ${sponsorSegments.length} 个广告片段，开始处理弹幕`);
@@ -578,12 +717,12 @@ export default defineBackground(() => {
                 const adjustedEndTime = endTime - totalRemovedTime;
 
                 // 移除广告片段时间范围内的弹幕
-                const filteredDanmakus = processedDanmakus.filter(danmaku => 
-                    danmaku.time < adjustedStartTime || danmaku.time >= adjustedEndTime
+                const filteredDanmakus = processedDanmakus.filter(
+                    (danmaku) => danmaku.time < adjustedStartTime || danmaku.time >= adjustedEndTime
                 );
 
                 // 将广告片段之后的弹幕时间轴向前偏移
-                const adjustedDanmakus = filteredDanmakus.map(danmaku => {
+                const adjustedDanmakus = filteredDanmakus.map((danmaku) => {
                     if (danmaku.time >= adjustedEndTime) {
                         return {
                             ...danmaku,
@@ -597,8 +736,10 @@ export default defineBackground(() => {
                 totalRemovedTime += segmentDuration;
             }
 
-            console.log(`广告片段处理完成，移除了 ${danmakus.length - processedDanmakus.length} 条弹幕，总计移除时长: ${totalRemovedTime.toFixed(2)}秒`);
-            
+            console.log(
+                `广告片段处理完成，移除了 ${danmakus.length - processedDanmakus.length} 条弹幕，总计移除时长: ${totalRemovedTime.toFixed(2)}秒`
+            );
+
             return processedDanmakus;
         } catch (error) {
             console.error('处理广告片段时出错:', error);
@@ -613,7 +754,7 @@ export default defineBackground(() => {
             const wbiKeys = await getWbiKeys();
 
             // 2. 获取视频信息
-            const { cid, duration, aid, title } = await getVideoInfo(bvid);
+            const { cid, duration, aid, title, pic, author } = await getVideoInfo(bvid);
 
             // 3. 计算分段数（每段6分钟）
             const segmentCount = Math.ceil(duration / 360);
@@ -670,7 +811,11 @@ export default defineBackground(() => {
             formattedDanmakus.sort((a, b) => a.time - b.time);
 
             // 移除广告片段弹幕
-            const processedDanmakus = await removeAdSegments(formattedDanmakus, bvid, youtubeVideoDuration);
+            const processedDanmakus = await removeAdSegments(
+                formattedDanmakus,
+                bvid,
+                youtubeVideoDuration
+            );
 
             // 统计weight分布（用于调试）
             // const weightStats = {};
@@ -683,6 +828,8 @@ export default defineBackground(() => {
             return {
                 danmakus: processedDanmakus,
                 title: title,
+                pic: pic,
+                author: author,
                 duration: duration
             };
         } catch (error) {
@@ -724,6 +871,7 @@ export default defineBackground(() => {
 
             // 发起API请求
             const response = await fetch(apiUrl, {
+                credentials: 'include',
                 headers: {
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                     Referer: 'https://www.bilibili.com/',
@@ -801,6 +949,7 @@ export default defineBackground(() => {
 
             // 发起API请求
             const response = await fetch(apiUrl, {
+                credentials: 'include',
                 headers: {
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                     Referer: 'https://search.bilibili.com/',
@@ -884,6 +1033,7 @@ export default defineBackground(() => {
 
             // 发起API请求
             const response = await fetch(apiUrl, {
+                credentials: 'include',
                 headers: {
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                     Referer: 'https://search.bilibili.com/',
@@ -943,6 +1093,247 @@ export default defineBackground(() => {
         }
     }
 
+    function normalizeBilibiliSearchKeyword(keyword) {
+        return String(keyword || '')
+            .replace(/[\p{P}]/gu, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function removeBracketedSearchTerms(keyword) {
+        return normalizeBilibiliSearchKeyword(
+            String(keyword || '')
+                .replace(/【[^】]*】/g, ' ')
+                .replace(/「[^」]*」/g, ' ')
+                .replace(/『[^』]*』/g, ' ')
+                .replace(/《[^》]*》/g, ' ')
+                .replace(/〈[^〉]*〉/g, ' ')
+                .replace(/（[^）]*）/g, ' ')
+                .replace(/\([^)]*\)/g, ' ')
+                .replace(/\[[^\]]*\]/g, ' ')
+                .replace(/［[^］]*］/g, ' ')
+                .replace(/〔[^〕]*〕/g, ' ')
+                .replace(/\{[^}]*\}/g, ' ')
+        );
+    }
+
+    function isCsrfSearchBlock(data) {
+        return data?.code === -111 && String(data?.message || '').includes('csrf');
+    }
+
+    function normalizeMatchText(text) {
+        return String(text || '').replace(/[^\p{L}\p{N}]/gu, '');
+    }
+
+    function splitTitleSegments(title) {
+        return String(title || '')
+            .split(/\s*(?:[|｜丨]|-{1,2}|:|：)\s*/g)
+            .map((part) => part.trim())
+            .filter(Boolean);
+    }
+
+    function getLongestCommonSubsequenceLength(a, b) {
+        if (!a || !b) return 0;
+
+        const previous = new Array(b.length + 1).fill(0);
+        const current = new Array(b.length + 1).fill(0);
+
+        for (let i = 1; i <= a.length; i++) {
+            for (let j = 1; j <= b.length; j++) {
+                current[j] =
+                    a[i - 1] === b[j - 1]
+                        ? previous[j - 1] + 1
+                        : Math.max(previous[j], current[j - 1]);
+            }
+
+            previous.splice(0, previous.length, ...current);
+            current.fill(0);
+        }
+
+        return previous[b.length];
+    }
+
+    function calculateKeywordMatchRatio(sourceTitle, targetTitle) {
+        const sourceText = normalizeMatchText(sourceTitle);
+        const targetText = normalizeMatchText(targetTitle);
+
+        if (!sourceText || !targetText) return 0;
+
+        const matchLength = getLongestCommonSubsequenceLength(sourceText, targetText);
+        return Math.min(matchLength / sourceText.length, 1);
+    }
+
+    function calculateTitleContainmentRatio(sourceTitle, targetTitle) {
+        const sourceText = normalizeMatchText(sourceTitle);
+        const targetText = normalizeMatchText(targetTitle);
+
+        if (!sourceText || !targetText) return 0;
+        if (targetText.includes(sourceText)) return 1;
+
+        const targetSegments = splitTitleSegments(targetTitle);
+        for (const segment of targetSegments) {
+            const segmentText = normalizeMatchText(segment);
+            if (segmentText && segmentText.includes(sourceText)) {
+                return 1;
+            }
+        }
+
+        return 0;
+    }
+
+    // 综合搜索视频（使用 search/all/v2 API）
+    async function searchBilibiliVideoAllV2(keyword, options = {}) {
+        try {
+            const originalKeyword = String(keyword || '');
+            const matchKeyword = String(options.matchKeyword || originalKeyword);
+            // 将标点符号替换为空格，优化 B 站搜索体验
+            keyword = normalizeBilibiliSearchKeyword(originalKeyword);
+            console.log(`[searchBilibiliVideoAllV2] 开始搜索: "${keyword}"`);
+
+            // 获取WBI Keys
+            const wbiKeys = await getWbiKeys();
+
+            // 构建API参数（综合搜索只需要 keyword）
+            const params = {
+                keyword: keyword,
+                order: 'dm',
+                wts: Math.round(Date.now() / 1000)
+            };
+
+            // 生成签名
+            const query = encWbi(params, wbiKeys.img_key, wbiKeys.sub_key);
+            const apiUrl = `https://api.bilibili.com/x/web-interface/wbi/search/all/v2?${query}`;
+
+            console.log(`[searchBilibiliVideoAllV2] API URL: ${apiUrl}`);
+
+            // 发起API请求
+            const response = await fetch(apiUrl, {
+                credentials: 'include',
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    Referer: 'https://search.bilibili.com/',
+                    Origin: 'https://www.bilibili.com'
+                }
+            });
+
+            if (!response.ok) {
+                throw new Error(`API请求失败: ${response.status}`);
+            }
+
+            const data = await response.json();
+
+            // 原样打印完整的搜索结果
+            console.log(
+                '[searchBilibiliVideoAllV2] 搜索结果原始数据:',
+                JSON.stringify(data, null, 2)
+            );
+
+            if (isCsrfSearchBlock(data) && !options.skipBracketFallback) {
+                const fallbackKeyword = removeBracketedSearchTerms(originalKeyword);
+                if (fallbackKeyword && fallbackKeyword !== keyword) {
+                    console.log(
+                        `[searchBilibiliVideoAllV2] 搜索被关键词拦截，移除括号内容后重试: "${keyword}" → "${fallbackKeyword}"`
+                    );
+                    return searchBilibiliVideoAllV2(fallbackKeyword, {
+                        skipBracketFallback: true,
+                        matchKeyword: matchKeyword
+                    });
+                }
+            }
+
+            if (data.code !== 0) {
+                throw new Error(`API返回错误: ${data.message || '未知错误'}`);
+            }
+
+            // 解码 HTML 实体（如 &quot; → "）
+            const decodeHtmlEntities = (str) => {
+                return str
+                    .replace(/&quot;/g, '"')
+                    .replace(/&amp;/g, '&')
+                    .replace(/&lt;/g, '<')
+                    .replace(/&gt;/g, '>')
+                    .replace(/&nbsp;/g, ' ')
+                    .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(code));
+            };
+
+            // 计算高亮字符占标题总长度的比例（只保留字母和数字）
+            function calculateHighlightRatio(htmlTitle) {
+                // 只保留字母和数字（去掉标点、符号、空格等）
+                const removeNonText = (str) => str.replace(/[^\p{L}\p{N}]/gu, '');
+
+                // 提取 <em> 标签内的文本长度
+                const emMatches = htmlTitle.match(/<em[^>]*>([^<]*)<\/em>/g) || [];
+                let highlightLength = 0;
+                emMatches.forEach((match) => {
+                    const text = removeNonText(decodeHtmlEntities(match.replace(/<[^>]*>/g, '')));
+                    highlightLength += text.length;
+                });
+
+                // 去掉所有标签后的纯文本，截取前 26 个字符（模拟 B 站显示长度），再去掉标点和空格
+                const plainTextFull = decodeHtmlEntities(htmlTitle.replace(/<[^>]*>/g, ''));
+                const truncatedPlainText = plainTextFull.substring(0, 26);
+                const plainText = removeNonText(truncatedPlainText);
+                const totalLength = plainText.length;
+
+                // 比例可能超过 1（高亮部分在截断范围外），取最大值 1
+                const ratio = totalLength > 0 ? highlightLength / totalLength : 0;
+                return Math.min(ratio, 1);
+            }
+
+            // 从 result 数组中提取视频结果
+            const results = [];
+            if (data.data && data.data.result) {
+                // 查找 result_type 为 'video' 的项
+                const videoResult = data.data.result.find((item) => item.result_type === 'video');
+
+                if (videoResult && videoResult.data) {
+                    for (const video of videoResult.data.slice(0, 15)) {
+                        // 只返回前15个结果
+                        // 去掉 HTML 标签并解码实体
+                        const cleanTitle = decodeHtmlEntities(video.title.replace(/<[^>]*>/g, ''));
+                        const emRatio = calculateHighlightRatio(video.title);
+                        const keywordRatio = options.matchKeyword
+                            ? calculateKeywordMatchRatio(matchKeyword, cleanTitle)
+                            : 0;
+                        const containmentRatio = calculateTitleContainmentRatio(
+                            matchKeyword,
+                            cleanTitle
+                        );
+                        const highlightRatio = Math.max(emRatio, keywordRatio, containmentRatio);
+                        results.push({
+                            bvid: video.bvid,
+                            title: cleanTitle,
+                            author: video.author,
+                            mid: video.mid,
+                            pic: video.pic.startsWith('//') ? `https:${video.pic}` : video.pic,
+                            play: video.play,
+                            danmaku: Number(video.danmaku ?? video.dm ?? video.video_review ?? 0),
+                            duration: video.duration,
+                            pubdate: video.pubdate,
+                            highlightRatio: highlightRatio // 高亮比例，用于判断匹配度
+                        });
+                    }
+                }
+            }
+
+            results.sort((a, b) => (b.danmaku || 0) - (a.danmaku || 0));
+
+            console.log(`[searchBilibiliVideoAllV2] 找到 ${results.length} 个视频结果`);
+
+            return {
+                success: true,
+                results: results,
+                keyword: keyword
+            };
+        } catch (error) {
+            console.error('[searchBilibiliVideoAllV2] 搜索失败:', error);
+            return {
+                success: false,
+                error: error.message
+            };
+        }
+    }
+
     // 分割标题重新搜索的辅助函数
     async function searchWithSplitTitle(bilibiliUID, title, wbiKeys) {
         try {
@@ -986,6 +1377,7 @@ export default defineBackground(() => {
                     console.log(`备用搜索API URL: ${apiUrl}`);
 
                     const response = await fetch(apiUrl, {
+                        credentials: 'include',
                         headers: {
                             'User-Agent':
                                 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -1079,34 +1471,39 @@ export default defineBackground(() => {
         return results;
     }
 
-    // 存储待发送的搜索结果
-    let pendingSearchResults = null;
-
-    // 存储待发送的未匹配结果
-    let pendingNoMatchResults = null;
-
     // 处理多个搜索结果的弹窗显示
-    async function handleMultipleResults(request) {
+    async function handleMultipleResults(request, sender) {
         try {
+            const tabId = sender.tab?.id;
+            if (tabId == null) {
+                throw new Error('无法确定搜索结果所属的标签页');
+            }
+
             console.log('处理多个搜索结果弹窗:', request.results.length);
 
             // 暂存搜索结果，等待popup准备好接收
-            pendingSearchResults = {
+            const pendingSearchResults = {
+                tabId: tabId,
                 results: request.results,
                 youtubeVideoId: request.youtubeVideoId,
                 channelInfo: request.channelInfo,
                 videoTitle: request.videoTitle,
+                source: request.source || 'legacy-search',
+                matchMode: request.matchMode || 'legacy',
                 timestamp: Date.now()
             };
 
-            // 同时存储到storage作为备用
-            await browser.storage.local.set({
-                pendingSearchResults: pendingSearchResults
-            });
+            await setPendingPopupData('pendingSearchResults', tabId, pendingSearchResults);
 
             // 打开popup窗口
             try {
-                await browser.action.openPopup();
+                if (browser?.action?.openPopup) {
+                    await browser.action.openPopup();
+                } else if (browser?.browserAction?.openPopup) {
+                    await browser.browserAction.openPopup();
+                } else {
+                    throw new Error('不支持自动打开popup');
+                }
                 console.log('popup窗口已打开，等待ready信号...');
             } catch (error) {
                 console.log('无法自动打开popup，可能需要用户手动点击:', error.message);
@@ -1123,26 +1520,37 @@ export default defineBackground(() => {
     }
 
     // 处理未匹配结果的弹窗显示
-    async function handleNoMatchResults(request) {
+    async function handleNoMatchResults(request, sender) {
         try {
+            const tabId = sender.tab?.id;
+            if (tabId == null) {
+                throw new Error('无法确定未匹配结果所属的标签页');
+            }
+
             console.log('处理未匹配结果弹窗:', request.channelInfo);
 
             // 暂存未匹配结果，等待popup准备好接收
-            pendingNoMatchResults = {
+            const pendingNoMatchResults = {
+                tabId: tabId,
                 youtubeVideoId: request.youtubeVideoId,
                 channelInfo: request.channelInfo,
                 videoTitle: request.videoTitle,
+                source: request.source || 'legacy-search',
+                matchMode: request.matchMode || 'legacy',
                 timestamp: Date.now()
             };
 
-            // 同时存储到storage作为备用
-            await browser.storage.local.set({
-                pendingNoMatchResults: pendingNoMatchResults
-            });
+            await setPendingPopupData('pendingNoMatchResults', tabId, pendingNoMatchResults);
 
             // 打开popup窗口
             try {
-                await browser.action.openPopup();
+                if (browser?.action?.openPopup) {
+                    await browser.action.openPopup();
+                } else if (browser?.browserAction?.openPopup) {
+                    await browser.browserAction.openPopup();
+                } else {
+                    throw new Error('不支持自动打开popup');
+                }
                 console.log('popup窗口已打开，等待ready信号...');
             } catch (error) {
                 console.log('无法自动打开popup，可能需要用户手动点击:', error.message);
@@ -1192,12 +1600,14 @@ export default defineBackground(() => {
 
     // 扩展启动时清理过期数据
     browser.runtime.onStartup.addListener(() => {
-        console.log('浏览器启动，异步清理过期弹幕数据');
+        console.log('浏览器启动');
+        console.log('异步清理过期弹幕数据');
         cleanupExpiredDanmaku();
     });
 
     browser.runtime.onInstalled.addListener(() => {
-        console.log('扩展安装/更新，异步清理过期弹幕数据');
+        console.log('扩展安装/更新');
+        console.log('异步清理过期弹幕数据');
         cleanupExpiredDanmaku();
     });
 
@@ -1206,11 +1616,20 @@ export default defineBackground(() => {
         if (request.type === 'downloadDanmaku') {
             downloadAllDanmaku(request.bvid, request.youtubeVideoDuration)
                 .then(async (data) => {
+                    const matchInfo = request.matchInfo || {};
                     // 保存弹幕数据
                     const storageData = {
                         [request.youtubeVideoId]: {
+                            bvid: request.bvid,
                             bilibili_url: `https://www.bilibili.com/video/${request.bvid}`,
                             bilibili_title: data.title,
+                            bilibili_pic: matchInfo.pic || data.pic || '',
+                            bilibili_author: matchInfo.author || data.author || '',
+                            matchRatio:
+                                typeof matchInfo.highlightRatio === 'number'
+                                    ? matchInfo.highlightRatio
+                                    : null,
+                            matchSource: matchInfo.source || 'manual',
                             danmakus: data.danmakus,
                             duration: data.duration,
                             timeOffset: 0,
@@ -1240,7 +1659,11 @@ export default defineBackground(() => {
             return true; // 保持消息通道开启
         } else if (request.type === 'searchBilibiliVideo') {
             // 新增：B站视频搜索
-            searchBilibiliVideo(request.bilibiliUID, request.videoTitle, request.youtubeVideoDuration)
+            searchBilibiliVideo(
+                request.bilibiliUID,
+                request.videoTitle,
+                request.youtubeVideoDuration
+            )
                 .then((result) => {
                     sendResponse(result);
                 })
@@ -1271,6 +1694,84 @@ export default defineBackground(() => {
             searchBilibiliVideoGlobal(request.keyword)
                 .then((result) => {
                     sendResponse(result);
+                })
+                .catch((error) => {
+                    sendResponse({
+                        success: false,
+                        error: error.message
+                    });
+                });
+
+            return true; // 保持消息通道开启
+        } else if (request.type === 'searchBilibiliVideoAllV2') {
+            // 综合搜索视频（使用 search/all/v2 API）
+            searchBilibiliVideoAllV2(request.keyword)
+                .then((result) => {
+                    sendResponse(result);
+                })
+                .catch((error) => {
+                    sendResponse({
+                        success: false,
+                        error: error.message
+                    });
+                });
+
+            return true; // 保持消息通道开启
+        } else if (request.type === 'downloadDanmakuForQuark') {
+            // Quark 专用：下载弹幕并保存（使用 quark_ 前缀）
+            downloadAllDanmaku(request.bvid, request.videoDuration)
+                .then(async (data) => {
+                    const matchInfo = request.matchInfo || {};
+                    // 保存弹幕数据（使用 quark_ 前缀）
+                    const storageKey = request.quarkVideoId?.startsWith('quark_')
+                        ? request.quarkVideoId
+                        : `quark_${request.quarkVideoId}`;
+                    const storageData = {
+                        [storageKey]: {
+                            bvid: request.bvid,
+                            bilibili_url: `https://www.bilibili.com/video/${request.bvid}`,
+                            bilibili_title: data.title,
+                            bilibili_pic: matchInfo.pic || data.pic || '',
+                            bilibili_author: matchInfo.author || data.author || '',
+                            matchRatio:
+                                typeof matchInfo.highlightRatio === 'number'
+                                    ? matchInfo.highlightRatio
+                                    : null,
+                            matchSource: matchInfo.source || 'search',
+                            danmakus: data.danmakus,
+                            duration: data.duration,
+                            timeOffset: 0,
+                            lastUpdate: Date.now()
+                        }
+                    };
+
+                    // 尝试存储，如果空间不足则清理后重试
+                    try {
+                        await browser.storage.local.set(storageData);
+                    } catch (storageError) {
+                        // 检查是否是配额超限错误
+                        if (storageError.message && storageError.message.includes('quota')) {
+                            console.log('[Quark] 存储空间不足，清理过期数据后重试...');
+                            await cleanupExpiredDanmaku();
+                            // 重试存储
+                            await browser.storage.local.set(storageData);
+                        } else {
+                            throw storageError;
+                        }
+                    }
+
+                    console.log(`[Quark] 弹幕已保存: ${storageKey}, ${data.danmakus.length} 条`);
+
+                    // 异步清理过期弹幕数据，不阻塞响应
+                    Promise.resolve().then(() => {
+                        cleanupExpiredDanmaku();
+                    });
+
+                    sendResponse({
+                        success: true,
+                        count: data.danmakus.length,
+                        title: data.title
+                    });
                 })
                 .catch((error) => {
                     sendResponse({
@@ -1323,7 +1824,7 @@ export default defineBackground(() => {
             return true; // 保持消息通道开启
         } else if (request.type === 'showMultipleResults') {
             // 新增：处理多个搜索结果的弹窗显示
-            handleMultipleResults(request)
+            handleMultipleResults(request, sender)
                 .then((result) => {
                     sendResponse(result);
                 })
@@ -1337,7 +1838,7 @@ export default defineBackground(() => {
             return true; // 保持消息通道开启
         } else if (request.type === 'showNoMatchResults') {
             // 新增：处理未匹配结果的弹窗显示
-            handleNoMatchResults(request)
+            handleNoMatchResults(request, sender)
                 .then((result) => {
                     sendResponse(result);
                 })
@@ -1355,23 +1856,17 @@ export default defineBackground(() => {
 
             // 处理异步操作
             (async () => {
-                // 优先使用内存中的数据
-                let dataToSend = pendingSearchResults;
-                let noMatchDataToSend = pendingNoMatchResults;
-
-                // 如果内存中没有数据，尝试从storage获取
-                if (!dataToSend && !noMatchDataToSend) {
-                    try {
-                        const result = await browser.storage.local.get([
-                            'pendingSearchResults',
-                            'pendingNoMatchResults'
-                        ]);
-                        dataToSend = result.pendingSearchResults;
-                        noMatchDataToSend = result.pendingNoMatchResults;
-                    } catch (error) {
-                        console.log('获取storage搜索结果失败:', error);
-                    }
+                const popupTabId = request.tabId;
+                if (popupTabId == null) {
+                    sendResponse({ success: false, message: 'missing tab id' });
+                    return;
                 }
+
+                const dataToSend = await getPendingPopupData('pendingSearchResults', popupTabId);
+                const noMatchDataToSend = await getPendingPopupData(
+                    'pendingNoMatchResults',
+                    popupTabId
+                );
 
                 if (dataToSend && dataToSend.results) {
                     // 检查数据是否过期（5分钟内有效）
@@ -1385,13 +1880,14 @@ export default defineBackground(() => {
                             browser.runtime
                                 .sendMessage({
                                     type: 'displayMultipleResults',
+                                    tabId: popupTabId,
                                     data: dataToSend
                                 })
-                                .then(() => {
-                                    // 发送成功后清理storage中的数据
-                                    browser.storage.local.remove('pendingSearchResults');
-                                    pendingSearchResults = null;
-                                    console.log('已清理pendingSearchResults数据');
+                                .then(async () => {
+                                    await clearPendingPopupData('pendingSearchResults', popupTabId);
+                                    console.log(
+                                        `已清理标签页${popupTabId}的pendingSearchResults数据`
+                                    );
                                 })
                                 .catch((error) => {
                                     console.log('发送搜索结果消息失败:', error);
@@ -1401,8 +1897,7 @@ export default defineBackground(() => {
                         sendResponse({ success: true });
                     } else {
                         console.log('搜索结果已过期，清理数据');
-                        pendingSearchResults = null;
-                        browser.storage.local.remove('pendingSearchResults');
+                        await clearPendingPopupData('pendingSearchResults', popupTabId);
                         sendResponse({ success: false, message: 'results expired' });
                     }
                 } else if (noMatchDataToSend) {
@@ -1417,13 +1912,17 @@ export default defineBackground(() => {
                             browser.runtime
                                 .sendMessage({
                                     type: 'displayNoMatchResults',
+                                    tabId: popupTabId,
                                     data: noMatchDataToSend
                                 })
-                                .then(() => {
-                                    // 发送成功后清理storage中的数据
-                                    browser.storage.local.remove('pendingNoMatchResults');
-                                    pendingNoMatchResults = null;
-                                    console.log('已清理pendingNoMatchResults数据');
+                                .then(async () => {
+                                    await clearPendingPopupData(
+                                        'pendingNoMatchResults',
+                                        popupTabId
+                                    );
+                                    console.log(
+                                        `已清理标签页${popupTabId}的pendingNoMatchResults数据`
+                                    );
                                 })
                                 .catch((error) => {
                                     console.log('发送未匹配结果消息失败:', error);
@@ -1433,8 +1932,7 @@ export default defineBackground(() => {
                         sendResponse({ success: true });
                     } else {
                         console.log('未匹配结果已过期，清理数据');
-                        pendingNoMatchResults = null;
-                        browser.storage.local.remove('pendingNoMatchResults');
+                        await clearPendingPopupData('pendingNoMatchResults', popupTabId);
                         sendResponse({ success: false, message: 'no match results expired' });
                     }
                 } else {
@@ -1447,9 +1945,16 @@ export default defineBackground(() => {
         } else if (request.type === 'clearSearchResults') {
             // 清理搜索结果
             console.log('清理搜索结果数据');
-            pendingSearchResults = null;
-            pendingNoMatchResults = null;
-            browser.storage.local.remove(['pendingSearchResults', 'pendingNoMatchResults']);
+            const popupTabId = request.tabId ?? sender.tab?.id;
+
+            if (popupTabId == null) {
+                sendResponse({ success: false, error: 'missing tab id' });
+                return true;
+            }
+
+            clearAllPendingPopupData(popupTabId).catch((error) => {
+                console.log(`清理标签页${popupTabId}搜索结果数据失败:`, error);
+            });
             sendResponse({ success: true });
 
             return true;
@@ -1486,6 +1991,15 @@ export default defineBackground(() => {
 
             sendResponse({ success: true });
             return true;
+        } else if (request.type === 'clearTabCache') {
+            // 清除指定标签页的缓存
+            console.log('清除标签页缓存:', request.tabId);
+            if (request.tabId) {
+                clearTabPageState(request.tabId);
+            }
+
+            sendResponse({ success: true });
+            return true;
         } else if (request.type === 'pageInfoUpdated') {
             // 页面信息更新通知
             console.log('页面信息更新:', request.pageInfo.videoId);
@@ -1500,33 +2014,46 @@ export default defineBackground(() => {
             // popup请求从background获取页面信息
             (async () => {
                 try {
-                    // 获取当前活跃标签页
-                    const [activeTab] = await browser.tabs.query({
-                        active: true,
-                        currentWindow: true
-                    });
+                    let targetTabId = request.tabId;
+                    let targetTabUrl = request.tabUrl;
 
-                    if (!activeTab || !activeTab.id) {
+                    if (targetTabId == null) {
+                        const [activeTab] = await browser.tabs.query({
+                            active: true,
+                            currentWindow: true
+                        });
+
+                        targetTabId = activeTab?.id;
+                        targetTabUrl = activeTab?.url;
+                    }
+
+                    if (targetTabId == null) {
                         sendResponse({ success: false, error: '无法获取当前标签页' });
                         return;
                     }
 
                     // 检查是否有缓存的页面状态
-                    const cachedState = getTabPageState(activeTab.id);
+                    const cachedState = getTabPageState(targetTabId);
 
                     if (cachedState) {
-                        // 验证缓存的URL是否与当前标签页匹配
-                        if (cachedState.url === activeTab.url) {
-                            console.log('使用background缓存的页面信息');
-                            sendResponse({
-                                success: true,
-                                data: cachedState,
-                                fromCache: true
-                            });
-                            return;
+                        // 验证缓存的URL和视频ID是否与当前标签页匹配
+                        if (!targetTabUrl || cachedState.url === targetTabUrl) {
+                            const currentVideoId = targetTabUrl?.match(/[?&]v=([^&]+)/)?.[1];
+                            if (!currentVideoId || cachedState.videoId === currentVideoId) {
+                                console.log('使用background缓存的页面信息');
+                                sendResponse({
+                                    success: true,
+                                    data: cachedState,
+                                    fromCache: true
+                                });
+                                return;
+                            } else {
+                                console.log('缓存的视频ID与当前页面不匹配，清除过期状态');
+                                clearTabPageState(targetTabId);
+                            }
                         } else {
                             console.log('缓存的URL不匹配，清除过期状态');
-                            clearTabPageState(activeTab.id);
+                            clearTabPageState(targetTabId);
                         }
                     }
 
@@ -1534,7 +2061,7 @@ export default defineBackground(() => {
                     console.log('向content script请求最新页面信息');
 
                     browser.tabs.sendMessage(
-                        activeTab.id,
+                        targetTabId,
                         {
                             type: 'getPageInfo'
                         },
@@ -1550,7 +2077,7 @@ export default defineBackground(() => {
 
                             if (response && response.success) {
                                 // 缓存新获取的信息
-                                setTabPageState(activeTab.id, response.data);
+                                setTabPageState(targetTabId, response.data);
                                 sendResponse({
                                     success: true,
                                     data: response.data,

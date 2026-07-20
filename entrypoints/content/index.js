@@ -11,11 +11,124 @@ export default defineContentScript({
         let currentVideoId = null;
         let currentPageInfo = null;
         let pageInfoCache = new Map();
+        let activeInitToken = 0;
+        let pendingInitTimeout = null;
+        let urlObserver = null;
+        let videoTitleObserver = null;
+        let videoTitleObserverTarget = null;
+        let videoChangeCheckTimeout = null;
+        let videoChangePollInterval = null;
+        let handlingVideoSwitch = false;
+        let currentVideoTitleSnapshot = '';
+        const channelNameSelectors = [
+            'yt-formatted-string.ytd-channel-name a',
+            '#channel-name .ytd-channel-name a',
+            '.ytd-video-owner-renderer .ytd-channel-name a',
+            'ytd-channel-name a',
+            '#owner-sub-count a',
+            '.ytd-channel-name a'
+        ];
+        const channelLinkFallbackSelectors = ['a[href*="/@"]', 'a[href*="/channel/"]'];
+        const channelAvatarSelectors = [
+            '#avatar img',
+            '.ytd-video-owner-renderer img',
+            'yt-img-shadow img[alt*="avatar"]',
+            'yt-img-shadow img[alt*="Avatar"]'
+        ];
+        const channelRootSelectors = ['ytd-watch-metadata', '#owner', 'ytd-video-owner-renderer'];
 
         // 获取YouTube视频ID
         function getVideoId() {
             const match = window.location.href.match(/[?&]v=([^&]+)/);
             return match ? match[1] : null;
+        }
+
+        function extractChannelIdFromHref(href) {
+            if (!href) {
+                return '';
+            }
+
+            let match = href.match(/@([^\/\?#]+)/);
+            if (match) {
+                return '@' + match[1];
+            }
+
+            match = href.match(/channel\/([^\/\?#]+)/);
+            return match ? match[1] : '';
+        }
+
+        function getVisibleElements(selectors, root = document) {
+            const elements = [];
+            const seen = new Set();
+
+            for (const selector of selectors) {
+                const matches = root.querySelectorAll(selector);
+                for (const element of matches) {
+                    if (seen.has(element) || !isVisibleElement(element)) {
+                        continue;
+                    }
+
+                    seen.add(element);
+                    elements.push(element);
+                }
+            }
+
+            return elements;
+        }
+
+        function findChannelLinkCandidate() {
+            const visibleRoots = getVisibleElements(channelRootSelectors);
+
+            for (const root of visibleRoots) {
+                const scopedLinks = getVisibleElements(channelNameSelectors, root);
+                const completeLink = scopedLinks.find((element) => {
+                    return element.textContent.trim() && extractChannelIdFromHref(element.href);
+                });
+
+                if (completeLink) {
+                    return completeLink;
+                }
+            }
+
+            const globalCandidates = [
+                ...getVisibleElements(channelNameSelectors),
+                ...getVisibleElements(channelLinkFallbackSelectors)
+            ];
+
+            return (
+                globalCandidates.find((element) => {
+                    return element.textContent.trim() && extractChannelIdFromHref(element.href);
+                }) ||
+                globalCandidates[0] ||
+                null
+            );
+        }
+
+        function getChannelAvatar(channelLink) {
+            const avatarSearchRoots = [];
+            const ownerRoot = channelLink?.closest(
+                '#owner, ytd-video-owner-renderer, ytd-watch-metadata'
+            );
+
+            if (ownerRoot) {
+                avatarSearchRoots.push(ownerRoot);
+            }
+
+            avatarSearchRoots.push(...getVisibleElements(channelRootSelectors));
+
+            for (const root of avatarSearchRoots) {
+                const avatar = getVisibleElements(channelAvatarSelectors, root).find(
+                    (element) => !!element.src
+                );
+                if (avatar) {
+                    return avatar.src;
+                }
+            }
+
+            const fallbackAvatar = getVisibleElements(channelAvatarSelectors).find(
+                (element) => !!element.src
+            );
+            return fallbackAvatar ? fallbackAvatar.src : '';
         }
 
         // 获取YouTube频道信息（增强版）
@@ -26,80 +139,11 @@ export default defineContentScript({
                 let channelId = '';
                 let channelAvatar = '';
 
-                // 统一从频道链接元素获取名称和ID
-                const nameSelectors = [
-                    'yt-formatted-string.ytd-channel-name a',
-                    '#channel-name .ytd-channel-name a',
-                    '.ytd-video-owner-renderer .ytd-channel-name a',
-                    'ytd-channel-name a',
-                    '#owner-sub-count a',
-                    '.ytd-channel-name a'
-                ];
-
-                for (const selector of nameSelectors) {
-                    const element = document.querySelector(selector);
-                    if (element && element.textContent.trim()) {
-                        channelName = element.textContent.trim();
-
-                        // 同时从该元素获取频道ID
-                        if (element.href) {
-                            // 优先匹配 @username 格式
-                            let match = element.href.match(/@([^\/\?#]+)/);
-                            if (match) {
-                                channelId = '@' + match[1];
-                            } else {
-                                // 备选：匹配 /channel/UC... 格式
-                                match = element.href.match(/channel\/([^\/\?#]+)/);
-                                if (match) {
-                                    channelId = match[1];
-                                }
-                            }
-                        }
-
-                        // 如果获取到了名称和ID，结束循环
-                        if (channelName && channelId) {
-                            break;
-                        }
-                    }
-                }
-
-                // 如果上面没有获取到ID，尝试查找其他包含频道链接的元素
-                if (!channelId) {
-                    const channelElements = document.querySelectorAll(
-                        'a[href*="/@"], a[href*="/channel/"]'
-                    );
-                    for (const element of channelElements) {
-                        if (element.href) {
-                            // 优先匹配 @username 格式
-                            let match = element.href.match(/@([^\/\?#]+)/);
-                            if (match) {
-                                channelId = '@' + match[1];
-                                break;
-                            } else {
-                                // 备选：匹配 /channel/UC... 格式
-                                match = element.href.match(/channel\/([^\/\?#]+)/);
-                                if (match) {
-                                    channelId = match[1];
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // 获取频道头像
-                const avatarSelectors = [
-                    '#avatar img',
-                    '.ytd-video-owner-renderer img',
-                    'yt-img-shadow img[alt*="avatar"], yt-img-shadow img[alt*="Avatar"]'
-                ];
-
-                for (const selector of avatarSelectors) {
-                    const element = document.querySelector(selector);
-                    if (element && element.src) {
-                        channelAvatar = element.src;
-                        break;
-                    }
+                const channelLink = findChannelLinkCandidate();
+                if (channelLink) {
+                    channelName = channelLink.textContent.trim();
+                    channelId = extractChannelIdFromHref(channelLink.href);
+                    channelAvatar = getChannelAvatar(channelLink);
                 }
 
                 // 如果信息不完整且重试次数小于2，则重试
@@ -140,6 +184,37 @@ export default defineContentScript({
             }
         }
 
+        function getChannelInfoSnapshot() {
+            try {
+                const channelLink = findChannelLinkCandidate();
+                if (!channelLink) {
+                    return { success: false, timestamp: Date.now() };
+                }
+
+                const channelName = channelLink.textContent.trim();
+                const channelId = extractChannelIdFromHref(channelLink.href);
+                const channelAvatar = getChannelAvatar(channelLink);
+
+                return {
+                    channelId,
+                    channelName,
+                    channelAvatar,
+                    success: !!(channelId && channelName),
+                    timestamp: Date.now()
+                };
+            } catch (error) {
+                console.error('获取频道快照失败:', error);
+                return { success: false, timestamp: Date.now() };
+            }
+        }
+
+        function isMadeByBilibiliChannel(channelInfo) {
+            return (
+                channelInfo?.channelId === '@MadeByBilibili' ||
+                channelInfo?.channelName === 'MadeByBilibili'
+            );
+        }
+
         // 解析番剧标题和集数
         function parseBangumiTitle(videoTitle) {
             // 匹配 《标题》第x话：格式，确保"话"后面有冒号
@@ -154,8 +229,7 @@ export default defineContentScript({
             return { isValid: false };
         }
 
-        // 获取视频标题
-        function getVideoTitle() {
+        function getVideoTitleElement() {
             try {
                 const titleSelectors = [
                     'h1.ytd-watch-metadata yt-formatted-string',
@@ -167,8 +241,26 @@ export default defineContentScript({
                 for (const selector of titleSelectors) {
                     const element = document.querySelector(selector);
                     if (element && element.textContent.trim()) {
-                        return element.textContent.trim();
+                        return {
+                            el: element,
+                            selector,
+                            text: element.textContent.trim()
+                        };
                     }
+                }
+            } catch (error) {
+                console.error('获取视频标题元素失败:', error);
+            }
+
+            return null;
+        }
+
+        // 获取视频标题
+        function getVideoTitle() {
+            try {
+                const titleInfo = getVideoTitleElement();
+                if (titleInfo?.text) {
+                    return titleInfo.text;
                 }
 
                 // 从页面标题获取（去掉" - YouTube"后缀）
@@ -185,7 +277,7 @@ export default defineContentScript({
         }
 
         // 更新当前页面信息
-        async function updateCurrentPageInfo() {
+        async function updateCurrentPageInfo({ forceRefresh = false } = {}) {
             try {
                 const videoId = getVideoId();
                 if (!videoId) {
@@ -194,7 +286,7 @@ export default defineContentScript({
                 }
 
                 // 检查缓存
-                if (pageInfoCache.has(videoId)) {
+                if (!forceRefresh && pageInfoCache.has(videoId)) {
                     const cached = pageInfoCache.get(videoId);
                     // 如果缓存时间在30秒内，直接使用
                     if (Date.now() - cached.timestamp < 30000) {
@@ -206,10 +298,40 @@ export default defineContentScript({
                 console.log('更新页面信息:', videoId);
 
                 // 获取频道信息（可能需要重试）
-                const channelInfo = await getChannelInfo();
+                const initialChannelInfo = await getChannelInfo();
 
                 // 获取视频标题
                 const videoTitle = await getEnhancedVideoTitle(videoId);
+
+                const currentVideoId = getVideoId();
+                if (currentVideoId !== videoId) {
+                    console.log('页面信息更新期间视频已切换，忽略过期结果:', {
+                        requestedVideoId: videoId,
+                        currentVideoId: currentVideoId
+                    });
+                    return null;
+                }
+
+                // YouTube SPA 切换时，频道 DOM 可能会比标题更晚稳定，发布前再校验一次。
+                const revalidatedChannelInfo = await getChannelInfo();
+                const channelInfo = revalidatedChannelInfo.success
+                    ? revalidatedChannelInfo
+                    : initialChannelInfo;
+
+                if (
+                    initialChannelInfo.success &&
+                    revalidatedChannelInfo.success &&
+                    (initialChannelInfo.channelId !== revalidatedChannelInfo.channelId ||
+                        initialChannelInfo.channelName !== revalidatedChannelInfo.channelName)
+                ) {
+                    console.log('页面信息更新期间频道信息发生变化，使用重新校验后的结果:', {
+                        videoId: videoId,
+                        initialChannelId: initialChannelInfo.channelId,
+                        initialChannelName: initialChannelInfo.channelName,
+                        revalidatedChannelId: revalidatedChannelInfo.channelId,
+                        revalidatedChannelName: revalidatedChannelInfo.channelName
+                    });
+                }
 
                 if (channelInfo.success && videoTitle) {
                     const pageInfo = {
@@ -310,35 +432,229 @@ export default defineContentScript({
             }
         }
 
+        async function getDanmakuSettings() {
+            const result = await browser.storage.local.get('danmakuSettings');
+            return result.danmakuSettings || {};
+        }
+
+        async function isLegacyYouTubeMatchMode(settings = null) {
+            const currentSettings = settings || (await getDanmakuSettings());
+            return (currentSettings.youtubeMatchMode || 'autoDownload') === 'legacy';
+        }
+
+        async function shouldForceLegacyBangumiMode(token = activeInitToken) {
+            const videoId = getVideoId();
+            if (!videoId || !window.location.href.includes('youtube.com/watch')) {
+                return false;
+            }
+
+            if (
+                currentPageInfo?.videoId === videoId &&
+                isMadeByBilibiliChannel(currentPageInfo.channel)
+            ) {
+                return true;
+            }
+
+            const channelSnapshot = getChannelInfoSnapshot();
+            if (isMadeByBilibiliChannel(channelSnapshot)) {
+                return true;
+            }
+
+            const videoTitle = getVideoTitle();
+            if (!parseBangumiTitle(videoTitle).isValid) {
+                return false;
+            }
+
+            const channelInfo = await getChannelInfo();
+            if (!isCurrentVideoContext(token, videoId)) {
+                return false;
+            }
+
+            return isMadeByBilibiliChannel(channelInfo);
+        }
+
+        async function shouldUseLegacyYouTubeLogic(settings = null, token = activeInitToken) {
+            if (await isLegacyYouTubeMatchMode(settings)) {
+                return true;
+            }
+
+            return shouldForceLegacyBangumiMode(token);
+        }
+
+        function getSearchResultDanmakuCount(video) {
+            const count = Number(video?.danmaku ?? video?.dm ?? 0);
+            return Number.isFinite(count) ? count : 0;
+        }
+
+        function sortResultsByDanmaku(results) {
+            return [...(results || [])].sort(
+                (a, b) => getSearchResultDanmakuCount(b) - getSearchResultDanmakuCount(a)
+            );
+        }
+
+        function getMostDanmakuResult(results) {
+            return sortResultsByDanmaku(results)[0] || null;
+        }
+
+        function buildYouTubeMatchInfo(video, source = 'search') {
+            if (!video) return { source };
+
+            return {
+                source,
+                bvid: video.bvid,
+                title: video.title,
+                author: video.author,
+                pic: video.pic,
+                duration: video.duration,
+                highlightRatio: video.highlightRatio
+            };
+        }
+
         // 查找视频容器
+        function isVisibleElement(element) {
+            if (!element) {
+                return false;
+            }
+
+            if (!element.isConnected || element.closest('[hidden], [aria-hidden="true"]')) {
+                return false;
+            }
+
+            const style = window.getComputedStyle(element);
+            if (style.display === 'none' || style.visibility === 'hidden') {
+                return false;
+            }
+
+            const rect = element.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+        }
+
         function findVideoContainer() {
             // 最佳目标：直接包裹 <video> 元素的容器
             const videoContainer = document.querySelector('.html5-video-container');
-            if (videoContainer && videoContainer.offsetHeight > 0) {
+            if (isVisibleElement(videoContainer)) {
                 return videoContainer;
             }
 
-            // 备选方案：<video> 元素的直接父元素
+            // 备选方案：优先使用 <video> 最近的播放器容器
             const video = document.querySelector('video');
-            if (video && video.parentElement && video.parentElement.offsetHeight > 0) {
-                return video.parentElement;
+            if (video) {
+                const closestContainer = video.closest('.html5-video-container');
+                if (isVisibleElement(closestContainer)) {
+                    return closestContainer;
+                }
+
+                if (isVisibleElement(video.parentElement)) {
+                    return video.parentElement;
+                }
             }
 
             // 最后的备选：旧版播放器ID，兼容性考虑
             const moviePlayer = document.querySelector('#movie_player');
-            if (moviePlayer && moviePlayer.offsetHeight > 0) {
+            if (isVisibleElement(moviePlayer)) {
                 return moviePlayer;
             }
 
             return null;
         }
 
+        function isInitTokenCurrent(token) {
+            return token === activeInitToken;
+        }
+
+        function isCurrentVideoContext(token, videoId) {
+            if (isInitTokenCurrent(token)) {
+                return true;
+            }
+
+            return (
+                !!videoId &&
+                window.location.href.includes('youtube.com/watch') &&
+                getVideoId() === videoId
+            );
+        }
+
+        function resetDanmakuEngineState() {
+            if (danmakuEngine) {
+                danmakuEngine.destroy();
+                danmakuEngine = null;
+            }
+
+            stopAdStatusMonitoring();
+        }
+
+        async function waitForVideoContainer(token, maxAttempts = 20, delay = 500) {
+            for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                if (!isInitTokenCurrent(token)) {
+                    return null;
+                }
+
+                const container = findVideoContainer();
+                if (container) {
+                    return container;
+                }
+
+                if (attempt === 1 || attempt === maxAttempts || attempt % 5 === 0) {
+                    const video = document.querySelector('video');
+                    const rect = video ? video.getBoundingClientRect() : null;
+                    console.log('等待视频容器...', {
+                        attempt,
+                        hasVideo: !!video,
+                        videoReadyState: video ? video.readyState : null,
+                        videoSize: rect
+                            ? `${Math.round(rect.width)}x${Math.round(rect.height)}`
+                            : 'N/A'
+                    });
+                }
+
+                await new Promise((resolve) => setTimeout(resolve, delay));
+            }
+
+            return null;
+        }
+
+        function scheduleDanmakuEngineInit({ delay = 1000, updatePageInfo = false } = {}) {
+            activeInitToken += 1;
+            const token = activeInitToken;
+
+            if (pendingInitTimeout) {
+                clearTimeout(pendingInitTimeout);
+            }
+
+            pendingInitTimeout = setTimeout(async () => {
+                pendingInitTimeout = null;
+
+                const initialized = await initDanmakuEngine(token);
+                if (initialized && updatePageInfo && isInitTokenCurrent(token)) {
+                    await updateCurrentPageInfo();
+
+                    setTimeout(() => {
+                        if (!isInitTokenCurrent(token)) {
+                            return;
+                        }
+
+                        updateCurrentPageInfo({ forceRefresh: true }).catch((error) => {
+                            console.log('延迟复查页面信息失败:', error);
+                        });
+                    }, 1500);
+                }
+            }, delay);
+        }
+
         // 初始化弹幕引擎
-        async function initDanmakuEngine() {
-            const container = findVideoContainer();
+        async function initDanmakuEngine(token = activeInitToken) {
+            if (!isInitTokenCurrent(token)) {
+                return false;
+            }
+
+            const container = await waitForVideoContainer(token);
+            if (!isInitTokenCurrent(token)) {
+                return false;
+            }
+
             if (!container) {
                 console.log('未找到视频容器');
-                return;
+                return false;
             }
 
             console.log('找到视频容器:', {
@@ -348,13 +664,7 @@ export default defineContentScript({
                 height: container.offsetHeight
             });
 
-            // 销毁旧的引擎
-            if (danmakuEngine) {
-                danmakuEngine.destroy();
-            }
-
-            // 停止之前的监控
-            stopAdStatusMonitoring();
+            resetDanmakuEngineState();
 
             // 创建新引擎
             danmakuEngine = new DanmakuEngine(container);
@@ -362,22 +672,37 @@ export default defineContentScript({
             // 加载设置
             await loadSettings();
 
+            if (!isInitTokenCurrent(token)) {
+                return false;
+            }
+
             // 尝试加载当前视频的弹幕
             const videoId = getVideoId();
             if (videoId) {
+                currentVideoId = videoId;
+                currentVideoTitleSnapshot = getVideoTitle();
                 const hasExistingDanmaku = await loadDanmakuForVideo(videoId);
 
-                // 如果没有现有弹幕，触发自动检测
-                if (!hasExistingDanmaku) {
-                    // 延迟执行自动检测，确保页面完全加载
-                    setTimeout(() => {
-                        autoCheckAndDownloadDanmaku();
-                    }, 1000);
+                if (!isInitTokenCurrent(token)) {
+                    return false;
                 }
+
+                // 如果没有现有弹幕，立即触发自动检测
+                if (!hasExistingDanmaku) {
+                    autoCheckAndDownloadDanmaku(token).catch((error) => {
+                        console.error('自动检测弹幕失败:', error);
+                    });
+                }
+            }
+
+            if (!isInitTokenCurrent(token)) {
+                return false;
             }
 
             // 启动广告状态监控
             startAdStatusMonitoring();
+
+            return true;
         }
 
         // 加载设置
@@ -418,7 +743,151 @@ export default defineContentScript({
         }
 
         // 自动检测并下载弹幕
-        async function autoCheckAndDownloadDanmaku() {
+        async function autoCheckAndDownloadDanmaku(token = activeInitToken) {
+            const settings = await getDanmakuSettings();
+
+            if (await shouldUseLegacyYouTubeLogic(settings, token)) {
+                return legacyAutoCheckAndDownloadDanmaku(token);
+            }
+
+            return autoSearchAndDownloadDanmakuByTitle(token, settings);
+        }
+
+        async function downloadMatchedDanmaku(searchResult, videoId, youtubeVideoDuration, source) {
+            if (!searchResult?.bvid || !videoId) {
+                return false;
+            }
+
+            const downloadResponse = await browser.runtime.sendMessage({
+                type: 'downloadDanmaku',
+                bvid: searchResult.bvid,
+                youtubeVideoId: videoId,
+                youtubeVideoDuration: youtubeVideoDuration,
+                matchInfo: buildYouTubeMatchInfo(searchResult, source)
+            });
+
+            if (downloadResponse.success) {
+                console.log(`自动下载弹幕成功: ${downloadResponse.count} 条`);
+
+                browser.runtime
+                    .sendMessage({
+                        type: 'cleanupExpiredDanmaku'
+                    })
+                    .then(() => console.log('清理成功'))
+                    .catch((error) => console.log('触发清理失败:', error));
+
+                if (danmakuEngine) {
+                    await loadDanmakuForVideo(videoId);
+                }
+                return true;
+            }
+
+            console.error('自动下载弹幕失败:', downloadResponse.error);
+            return false;
+        }
+
+        async function autoSearchAndDownloadDanmakuByTitle(token, settings = {}) {
+            try {
+                const videoId = getVideoId();
+                if (!videoId) {
+                    console.log('无法获取视频ID，跳过新版自动检测');
+                    return false;
+                }
+
+                if (!isCurrentVideoContext(token, videoId)) {
+                    return false;
+                }
+
+                const videoTitle = getVideoTitle();
+
+                if (!videoTitle) {
+                    console.log('无法获取视频标题，跳过新版自动检测');
+                    return false;
+                }
+
+                const video = document.querySelector('video');
+                const youtubeVideoDuration = video ? video.duration : null;
+
+                console.log('新版标题搜索自动检测:', {
+                    videoId,
+                    videoTitle,
+                    youtubeVideoDuration
+                });
+
+                const searchResponse = await browser.runtime.sendMessage({
+                    type: 'searchBilibiliVideoAllV2',
+                    keyword: videoTitle
+                });
+
+                if (!isCurrentVideoContext(token, videoId)) {
+                    return false;
+                }
+
+                if (!searchResponse.success || !searchResponse.results?.length) {
+                    console.log('新版标题搜索未找到B站视频');
+                    return false;
+                }
+
+                const results = sortResultsByDanmaku(searchResponse.results);
+                const matchThreshold = (settings.youtubeMatchThreshold || 90) / 100;
+                const matchedResults = results.filter(
+                    (result) => (result.highlightRatio || 0) >= matchThreshold
+                );
+
+                if (matchedResults.length === 1) {
+                    console.log(
+                        `新版标题搜索仅 1 个结果达到 ${Math.round(matchThreshold * 100)}%，自动下载弹幕`
+                    );
+                    return downloadMatchedDanmaku(
+                        matchedResults[0],
+                        videoId,
+                        youtubeVideoDuration,
+                        'youtube-title-auto'
+                    );
+                }
+
+                if (matchedResults.length > 1) {
+                    const multiMatchMode = settings.youtubeMultiMatchMode || 'mostDanmaku';
+
+                    if (multiMatchMode === 'mostDanmaku') {
+                        const autoDownloadResult = getMostDanmakuResult(matchedResults);
+                        console.log(
+                            `新版标题搜索 ${matchedResults.length} 个结果达到 ${Math.round(matchThreshold * 100)}%，按 danmaku 字段选择弹幕最多结果: ${autoDownloadResult.bvid}, ${getSearchResultDanmakuCount(autoDownloadResult)} 条`
+                        );
+                        return downloadMatchedDanmaku(
+                            autoDownloadResult,
+                            videoId,
+                            youtubeVideoDuration,
+                            'youtube-title-auto'
+                        );
+                    }
+
+                    console.log(
+                        `新版标题搜索 ${matchedResults.length} 个结果达到 ${Math.round(matchThreshold * 100)}%，交由 Popup 选择`
+                    );
+                    browser.runtime.sendMessage({
+                        type: 'showMultipleResults',
+                        results: results,
+                        youtubeVideoId: videoId,
+                        channelInfo: currentPageInfo?.channel || { success: false },
+                        videoTitle: videoTitle,
+                        source: 'youtube-title-search',
+                        matchMode: 'title-search'
+                    });
+                    return true;
+                }
+
+                console.log(
+                    `新版标题搜索没有结果达到 ${Math.round(matchThreshold * 100)}%，不自动下载`
+                );
+                return false;
+            } catch (error) {
+                console.error('新版标题搜索自动检测失败:', error);
+                return false;
+            }
+        }
+
+        async function legacyAutoCheckAndDownloadDanmaku(token = activeInitToken) {
             try {
                 const videoId = getVideoId();
                 if (!videoId) {
@@ -426,8 +895,16 @@ export default defineContentScript({
                     return;
                 }
 
+                if (!isCurrentVideoContext(token, videoId)) {
+                    return;
+                }
+
                 // 获取频道信息
-                const channelInfo = getChannelInfo();
+                const channelInfo = await getChannelInfo();
+                if (!isCurrentVideoContext(token, videoId)) {
+                    return;
+                }
+
                 if (!channelInfo.success || !channelInfo.channelId) {
                     console.log('无法获取频道信息，跳过自动检测');
                     return;
@@ -435,6 +912,10 @@ export default defineContentScript({
 
                 // 获取增强的视频标题（支持多语言原始标题）
                 const videoTitle = await getEnhancedVideoTitle(videoId);
+                if (!isCurrentVideoContext(token, videoId)) {
+                    return;
+                }
+
                 if (!videoTitle) {
                     console.log('无法获取视频标题，跳过自动检测');
                     return;
@@ -467,6 +948,10 @@ export default defineContentScript({
                                 episodeNumber: parseResult.episode,
                                 youtubeVideoId: videoId
                             });
+
+                            if (!isCurrentVideoContext(token, videoId)) {
+                                return;
+                            }
 
                             if (response.success) {
                                 console.log(`番剧弹幕自动下载成功: ${response.count} 条`);
@@ -502,6 +987,10 @@ export default defineContentScript({
                     channelInfo.channelId
                 );
 
+                if (!isCurrentVideoContext(token, videoId)) {
+                    return;
+                }
+
                 if (!association) {
                     console.log('频道未关联B站UP主，跳过自动检测');
                     return;
@@ -529,6 +1018,10 @@ export default defineContentScript({
                     youtubeVideoDuration: youtubeVideoDuration
                 });
 
+                if (!isCurrentVideoContext(token, videoId)) {
+                    return;
+                }
+
                 if (searchResponse.success && searchResponse.results.length > 0) {
                     console.log(`找到 ${searchResponse.results.length} 个匹配视频`);
 
@@ -543,6 +1036,10 @@ export default defineContentScript({
                             youtubeVideoId: videoId,
                             youtubeVideoDuration: youtubeVideoDuration
                         });
+
+                        if (!isCurrentVideoContext(token, videoId)) {
+                            return;
+                        }
 
                         if (downloadResponse.success) {
                             console.log(`自动下载弹幕成功: ${downloadResponse.count} 条`);
@@ -589,47 +1086,317 @@ export default defineContentScript({
             }
         }
 
-        // 监听URL变化
-        let lastUrl = location.href;
-        new MutationObserver(() => {
-            const url = location.href;
-            if (url !== lastUrl) {
-                lastUrl = url;
-                handleUrlChange();
+        // 页面信息监控器
+        let pageInfoMonitor = null;
+        let lastKnownPageInfo = null;
+        let monitoringRunCount = 0;
+
+        // 启动页面信息持续监控
+        function startPageInfoMonitoring() {
+            console.log('启动页面信息持续监控');
+
+            // 停止现有的监控器防止重复
+            if (pageInfoMonitor) {
+                clearInterval(pageInfoMonitor);
+                pageInfoMonitor = null;
             }
-        }).observe(document, { subtree: true, childList: true });
 
-        // 处理URL变化（增强版）
-        function handleUrlChange() {
+            // 重置运行计数
+            monitoringRunCount = 0;
+
+            pageInfoMonitor = setInterval(async () => {
+                monitoringRunCount++;
+                console.log(`页面信息监控运行第 ${monitoringRunCount} 次`);
+
+                // 运行3次后自动停止
+                if (monitoringRunCount >= 3) {
+                    console.log('页面信息监控已运行3次，自动停止');
+                    stopPageInfoMonitoring();
+                    return;
+                }
+                try {
+                    const currentUrl = window.location.href;
+                    const videoId = getVideoId();
+
+                    // 如果不在YouTube视频页面，停止监控
+                    if (!videoId || !currentUrl.includes('youtube.com/watch')) {
+                        console.log('不在YouTube视频页面，停止监控');
+                        stopPageInfoMonitoring();
+                        return;
+                    }
+
+                    // 检查是否需要更新页面信息
+                    const needsUpdate =
+                        !lastKnownPageInfo ||
+                        lastKnownPageInfo.videoId !== videoId ||
+                        lastKnownPageInfo.url !== currentUrl ||
+                        !lastKnownPageInfo.channel ||
+                        !lastKnownPageInfo.channel.success ||
+                        !lastKnownPageInfo.channel.channelId;
+
+                    if (needsUpdate) {
+                        console.log('检测到页面信息需要更新:', {
+                            videoId,
+                            lastKnownVideoId: lastKnownPageInfo?.videoId,
+                            urlChanged: lastKnownPageInfo?.url !== currentUrl,
+                            noChannelInfo: !lastKnownPageInfo?.channel?.success
+                        });
+
+                        // 强制更新页面信息
+                        currentPageInfo = null;
+                        pageInfoCache.delete(videoId);
+
+                        await updateCurrentPageInfo();
+
+                        if (currentPageInfo) {
+                            lastKnownPageInfo = { ...currentPageInfo };
+
+                            // 立即通知background更新
+                            browser.runtime
+                                .sendMessage({
+                                    type: 'pageInfoUpdated',
+                                    pageInfo: currentPageInfo
+                                })
+                                .catch((error) => console.log('通知页面信息更新失败:', error));
+                        }
+                    }
+                } catch (error) {
+                    console.error('页面信息监控出错:', error);
+                    // 发生错误时停止监控，避免持续错误
+                    if (
+                        error.message &&
+                        (error.message.includes('Extension context invalidated') ||
+                            error.message.includes('Could not establish connection') ||
+                            error.message.includes('The message port closed'))
+                    ) {
+                        console.log('扩展上下文失效或连接断开，停止监控');
+                        stopPageInfoMonitoring();
+                    }
+                }
+            }, 2000); // 每2秒检查一次
+        }
+
+        // 停止页面信息监控
+        function stopPageInfoMonitoring() {
+            if (pageInfoMonitor) {
+                clearInterval(pageInfoMonitor);
+                pageInfoMonitor = null;
+                monitoringRunCount = 0;
+                console.log('停止页面信息监控');
+            }
+        }
+
+        async function startPageInfoMonitoringForMatchMode() {
+            if (await shouldUseLegacyYouTubeLogic()) {
+                startPageInfoMonitoring();
+            } else {
+                stopPageInfoMonitoring();
+            }
+        }
+
+        function getLightweightPageInfo() {
             const videoId = getVideoId();
-            if (videoId && videoId !== currentVideoId) {
+            if (!videoId || !window.location.href.includes('youtube.com/watch')) {
+                return null;
+            }
+
+            return {
+                channel: { success: false },
+                videoTitle: getVideoTitle(),
+                videoId,
+                timestamp: Date.now(),
+                url: window.location.href,
+                matchMode: 'title-search'
+            };
+        }
+
+        function getCurrentYouTubeVideoIdentity() {
+            const videoId = getVideoId();
+            if (!videoId || !window.location.href.includes('youtube.com/watch')) {
+                return null;
+            }
+
+            return {
+                videoId,
+                videoTitle: getVideoTitle(),
+                url: window.location.href
+            };
+        }
+
+        function attachVideoTitleObserver() {
+            const titleInfo = getVideoTitleElement();
+            const target = titleInfo?.el || null;
+
+            if (!target || target === videoTitleObserverTarget) {
+                return;
+            }
+
+            if (videoTitleObserver) {
+                videoTitleObserver.disconnect();
+            }
+
+            videoTitleObserverTarget = target;
+            videoTitleObserver = new MutationObserver(() => {
+                scheduleVideoChangeCheck(300);
+            });
+            videoTitleObserver.observe(target, {
+                childList: true,
+                characterData: true,
+                subtree: true
+            });
+        }
+
+        function scheduleVideoChangeCheck(delay = 500) {
+            if (videoChangeCheckTimeout) {
+                clearTimeout(videoChangeCheckTimeout);
+            }
+
+            videoChangeCheckTimeout = setTimeout(() => {
+                videoChangeCheckTimeout = null;
+                checkForVideoChange();
+            }, delay);
+        }
+
+        function startVideoChangeMonitoring() {
+            if (videoChangePollInterval) {
+                return;
+            }
+
+            attachVideoTitleObserver();
+            scheduleVideoChangeCheck(500);
+            videoChangePollInterval = setInterval(() => {
+                attachVideoTitleObserver();
+                scheduleVideoChangeCheck(0);
+            }, 2000);
+        }
+
+        function stopVideoChangeMonitoring() {
+            if (videoChangeCheckTimeout) {
+                clearTimeout(videoChangeCheckTimeout);
+                videoChangeCheckTimeout = null;
+            }
+
+            if (videoChangePollInterval) {
+                clearInterval(videoChangePollInterval);
+                videoChangePollInterval = null;
+            }
+
+            if (videoTitleObserver) {
+                videoTitleObserver.disconnect();
+                videoTitleObserver = null;
+            }
+
+            videoTitleObserverTarget = null;
+        }
+
+        async function checkForVideoChange() {
+            if (handlingVideoSwitch) {
+                return;
+            }
+
+            const identity = getCurrentYouTubeVideoIdentity();
+
+            if (!identity) {
+                if (currentVideoId) {
+                    console.log('离开YouTube视频页面');
+                    currentVideoId = null;
+                    currentVideoTitleSnapshot = '';
+                    currentPageInfo = null;
+                    lastKnownPageInfo = null;
+                    resetDanmakuEngineState();
+                    stopPageInfoMonitoring();
+                }
+                return;
+            }
+
+            if (!currentVideoId) {
+                currentVideoId = identity.videoId;
+                currentVideoTitleSnapshot = identity.videoTitle;
+                return;
+            }
+
+            const videoIdChanged = identity.videoId !== currentVideoId;
+            const titleChanged =
+                !!identity.videoTitle && identity.videoTitle !== currentVideoTitleSnapshot;
+
+            if (!videoIdChanged && !titleChanged) {
+                return;
+            }
+
+            await handleVideoIdentityChange(identity, videoIdChanged ? 'video-id' : 'title');
+        }
+
+        async function handleVideoIdentityChange(identity, reason) {
+            if (!identity || handlingVideoSwitch) {
+                return;
+            }
+
+            handlingVideoSwitch = true;
+            try {
                 const oldVideoId = currentVideoId;
-                currentVideoId = videoId;
+                const oldVideoTitle = currentVideoTitleSnapshot;
+                currentVideoId = identity.videoId;
+                currentVideoTitleSnapshot = identity.videoTitle;
 
-                console.log('视频切换:', { from: oldVideoId, to: videoId });
+                console.log('YouTube视频内容切换:', {
+                    reason,
+                    from: oldVideoId,
+                    to: identity.videoId,
+                    fromTitle: oldVideoTitle,
+                    toTitle: identity.videoTitle
+                });
 
-                // 立即清除旧的页面信息
                 currentPageInfo = null;
+                lastKnownPageInfo = null;
                 if (oldVideoId) {
                     pageInfoCache.delete(oldVideoId);
                 }
 
-                // 通知background script页面切换
+                resetDanmakuEngineState();
+
                 browser.runtime
                     .sendMessage({
                         type: 'pageChanged',
-                        videoId: videoId,
+                        videoId: identity.videoId,
                         oldVideoId: oldVideoId,
-                        url: window.location.href
+                        url: identity.url,
+                        reason: reason
                     })
                     .catch((error) => console.log('通知页面切换失败:', error));
 
-                // 延迟初始化，等待页面加载
-                setTimeout(async () => {
-                    await initDanmakuEngine();
-                    // 初始化完成后更新页面信息
-                    await updateCurrentPageInfo();
-                }, 1000);
+                const useLegacyMode = await shouldUseLegacyYouTubeLogic(null, activeInitToken);
+                if (useLegacyMode) {
+                    startPageInfoMonitoring();
+                } else {
+                    stopPageInfoMonitoring();
+                }
+
+                scheduleDanmakuEngineInit({ delay: 0, updatePageInfo: useLegacyMode });
+            } finally {
+                handlingVideoSwitch = false;
+            }
+        }
+
+        // 监听URL变化（按开关控制）
+        function setupUrlObserver() {
+            if (urlObserver) return;
+            let lastUrl = location.href;
+            urlObserver = new MutationObserver(() => {
+                const url = location.href;
+                if (url !== lastUrl) {
+                    lastUrl = url;
+                    scheduleVideoChangeCheck(100);
+                }
+            });
+            urlObserver.observe(document, { subtree: true, childList: true });
+        }
+
+        function teardownUrlObserver() {
+            if (urlObserver) {
+                try {
+                    urlObserver.disconnect();
+                } catch (e) {}
+                urlObserver = null;
             }
         }
 
@@ -638,6 +1405,20 @@ export default defineContentScript({
             if (request.type === 'updateSettings') {
                 if (danmakuEngine) {
                     danmakuEngine.updateSettings(request.settings);
+                }
+
+                if (window.location.href.includes('youtube.com/watch')) {
+                    shouldUseLegacyYouTubeLogic(request.settings, activeInitToken)
+                        .then((useLegacyMode) => {
+                            if (useLegacyMode) {
+                                startPageInfoMonitoring();
+                            } else {
+                                stopPageInfoMonitoring();
+                            }
+                        })
+                        .catch((error) => {
+                            console.log('更新页面信息监控状态失败:', error);
+                        });
                 }
             } else if (request.type === 'getVideoDuration') {
                 const video = document.querySelector('video');
@@ -656,19 +1437,43 @@ export default defineContentScript({
                     try {
                         const videoId = getVideoId();
 
+                        if (!(await shouldUseLegacyYouTubeLogic(null, activeInitToken))) {
+                            const lightweightPageInfo = getLightweightPageInfo();
+                            if (lightweightPageInfo) {
+                                sendResponse({
+                                    success: true,
+                                    data: lightweightPageInfo
+                                });
+                            } else {
+                                sendResponse({
+                                    success: false,
+                                    error: '无法获取页面信息'
+                                });
+                            }
+                            return;
+                        }
+
                         // 优先使用缓存的页面信息
                         if (currentPageInfo && currentPageInfo.videoId === videoId) {
-                            console.log('使用缓存的页面信息');
-                            sendResponse({
-                                success: true,
-                                data: currentPageInfo
+                            const cacheAge = Date.now() - currentPageInfo.timestamp;
+                            if (cacheAge > 1500) {
+                                console.log('使用缓存的页面信息');
+                                sendResponse({
+                                    success: true,
+                                    data: currentPageInfo
+                                });
+                                return;
+                            }
+
+                            console.log('页面信息刚更新，重新校验频道信息...', {
+                                videoId: videoId,
+                                cacheAge: cacheAge
                             });
-                            return;
                         }
 
                         // 重新获取页面信息
                         console.log('重新获取页面信息...');
-                        await updateCurrentPageInfo();
+                        await updateCurrentPageInfo({ forceRefresh: !!currentPageInfo });
 
                         if (currentPageInfo) {
                             sendResponse({
@@ -689,6 +1494,8 @@ export default defineContentScript({
                         });
                     }
                 })();
+
+                return true;
             }
 
             return true; // 保持消息通道开启
@@ -862,12 +1669,62 @@ export default defineContentScript({
         }
 
         // 页面加载完成后初始化
-        if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', () => {
-                setTimeout(initDanmakuEngine, 1000);
-            });
-        } else {
-            setTimeout(initDanmakuEngine, 1000);
+        function initializePage() {
+            scheduleDanmakuEngineInit({ delay: 0 });
+            setTimeout(() => {
+                startPageInfoMonitoringForMatchMode().catch((error) => {
+                    console.log('按匹配模式启动页面信息监控失败:', error);
+                });
+            }, 500);
         }
+
+        function startEnabledFeatures() {
+            setupUrlObserver();
+            startVideoChangeMonitoring();
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', initializePage, { once: true });
+            } else {
+                initializePage();
+            }
+        }
+
+        function teardownDisabledState() {
+            activeInitToken += 1;
+            if (pendingInitTimeout) {
+                clearTimeout(pendingInitTimeout);
+                pendingInitTimeout = null;
+            }
+            stopPageInfoMonitoring();
+            stopVideoChangeMonitoring();
+            resetDanmakuEngineState();
+            teardownUrlObserver();
+            currentVideoId = null;
+            currentVideoTitleSnapshot = '';
+        }
+
+        // 页面卸载时清理资源
+        window.addEventListener('beforeunload', () => {
+            console.log('页面卸载，清理监控器');
+            teardownDisabledState();
+        });
+
+        // 可见性变化时的处理
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'hidden') {
+                console.log('页面隐藏，暂停监控器');
+                stopPageInfoMonitoring();
+            } else if (document.visibilityState === 'visible') {
+                console.log('页面可见，恢复监控器');
+                setTimeout(() => {
+                    if (window.location.href.includes('youtube.com/watch')) {
+                        startPageInfoMonitoringForMatchMode().catch((error) => {
+                            console.log('按匹配模式恢复页面信息监控失败:', error);
+                        });
+                    }
+                }, 1000);
+            }
+        });
+
+        startEnabledFeatures();
     }
 });
